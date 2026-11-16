@@ -8,6 +8,7 @@ import java.net.URL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import tv.own.owntv.core.network.HttpClient
 
 /** What the other device says about itself when asked. */
 data class RemoteDevice(
@@ -131,7 +132,7 @@ class LocalSyncClient {
         val code = connection.responseCode
         if (code == HttpURLConnection.HTTP_OK) return
         // Never the body: an error page is HTML, and the credential is in the request either way.
-        Log.w(TAG, "Local sync request to ${connection.url.path} failed with HTTP $code")
+        Log.w(TAG, "Local sync request to ${HttpClient.redactUrl(connection.url.toString())} failed with HTTP $code")
         connection.disconnect()
         throw LocalSyncHttpException(code)
     }

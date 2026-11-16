@@ -5,7 +5,11 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageInfo
 import android.content.pm.PackageInstaller
+import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
@@ -22,6 +26,7 @@ import org.json.JSONObject
 import tv.own.owntv.core.CoreBuildInfo
 import java.io.File
 import java.io.IOException
+import java.security.MessageDigest
 
 /**
  * In-app updates straight from GitHub Releases: checks the repo's latest release, compares its tag
@@ -36,7 +41,13 @@ class UpdateManager(
     private val client: OkHttpClient,
     private val settings: tv.own.owntv.core.settings.SettingsRepository,
 ) {
-    data class UpdateInfo(val version: String, val notes: String, val apkUrl: String)
+    data class UpdateInfo(
+        val version: String,
+        val notes: String,
+        val apkUrl: String,
+        /** GitHub's `assets[].digest` (e.g. `sha256:...`); null on releases that predate it. */
+        val expectedDigest: String? = null,
+    )
 
     sealed interface Failure {
         data class CheckHttp(val code: Int) : Failure
@@ -68,6 +79,14 @@ class UpdateManager(
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Downloads follow redirects by hand, so each hop can be checked (see [executeUpdateRequest]). */
+    private val updateClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+    }
 
     private val _state = MutableStateFlow<State>(State.Idle)
     val state: StateFlow<State> = _state.asStateFlow()
@@ -115,20 +134,23 @@ class UpdateManager(
                     val assets = o.optJSONArray("assets") ?: throw InvalidReleaseResponseException()
                     // Releases carry one APK per ABI flavor (arm = generic, x86_64 suffixed). Never
                     // silently install an APK for the wrong ABI.
-                    val wantX86 = android.os.Build.SUPPORTED_ABIS.firstOrNull() == "x86_64"
-                    val apkUrl = (0 until assets.length())
+                    val wantX86 = Build.SUPPORTED_ABIS.firstOrNull() == "x86_64"
+                    val asset = (0 until assets.length())
                         .asSequence()
                         .mapNotNull { assets.optJSONObject(it) }
-                        .mapNotNull { asset ->
-                            val name = asset.optString("name")
-                            val url = asset.optString("browser_download_url")
-                            if (!name.endsWith(".apk") || url.isBlank()) return@mapNotNull null
-                            val isX86 = name.contains("x86_64", ignoreCase = true)
-                            if (isX86 == wantX86) url else null
+                        .firstOrNull { candidate ->
+                            val name = candidate.optString("name")
+                            val url = candidate.optString("browser_download_url")
+                            name.endsWith(".apk", ignoreCase = true) &&
+                                url.isNotBlank() &&
+                                name.contains("x86_64", ignoreCase = true) == wantX86
                         }
-                        .firstOrNull()
                         ?: throw NoCompatibleApkException()
-                    val info = UpdateInfo(version, notes, apkUrl)
+                    val apkUrl = asset.optString("browser_download_url")
+                    // Same-origin with the download URL: it detects truncation/corruption, it does
+                    // not prove publisher identity. The signer check below is unconditional.
+                    val digest = asset.optString("digest").takeIf { it.isNotBlank() }
+                    val info = UpdateInfo(version, notes, apkUrl, digest)
                     settings.recordUpdateCheck(System.currentTimeMillis())
                     if (isNewer(version, currentVersion)) _state.value = State.Available(info)
                     else _state.value = State.UpToDate
@@ -151,7 +173,7 @@ class UpdateManager(
                 out.delete() // never build on top of a previous half-download
                 val request = Request.Builder().url(info.apkUrl).header("User-Agent", "OwnTV").build()
                 try {
-                    client.newCall(request).execute().use { resp ->
+                    executeUpdateRequest(request).use { resp ->
                         if (!resp.isSuccessful) throw DownloadHttpException(resp.code)
                         val body = resp.body
                         val total = body.contentLength()
@@ -159,6 +181,7 @@ class UpdateManager(
                         // the download needs room for two of it. Checking up front turns a silent short
                         // write — which reaches the installer as "App not installed" — into a real message.
                         if (total > 0 && dir.usableSpace < total * 2) throw NotEnoughSpaceException(total * 2)
+                        val digest = MessageDigest.getInstance("SHA-256")
                         var copied = 0L
                         body.byteStream().use { input ->
                             out.outputStream().use { output ->
@@ -167,6 +190,7 @@ class UpdateManager(
                                     val n = input.read(buf)
                                     if (n < 0) break
                                     output.write(buf, 0, n)
+                                    digest.update(buf, 0, n)
                                     copied += n
                                     if (total > 0) _state.value = State.Downloading((copied * 100 / total).toInt())
                                 }
@@ -176,6 +200,8 @@ class UpdateManager(
                         if (total > 0 && copied != total) {
                             throw DamagedDownloadException("truncated: got $copied of $total bytes")
                         }
+                        // Computed while writing, so the bytes verified are exactly the bytes kept.
+                        verifyDigest(digest, info.expectedDigest)
                     }
                     verifyApk(out)
                     install(out)
@@ -193,15 +219,133 @@ class UpdateManager(
     }
 
     /**
-     * Refuses anything the system cannot read back as this app's package. A truncated or corrupted
-     * APK is otherwise only rejected by the installer itself, which reports nothing to us and shows
-     * the user a bare "App not installed" — the failure this whole guard exists to explain.
+     * 校验下载包是否为可安装的官方更新。
+     *
+     * 校验顺序：可解析性 -> 包名 -> debuggable -> 签名 -> 版本递增。
+     * 任意一项失败都抛出 [DamagedDownloadException]，由调用方删除文件并提示用户。
+     *
+     * @param apk 已落盘的更新 APK
      */
+    @Suppress("DEPRECATION")
     private fun verifyApk(apk: File) {
-        val info = context.packageManager.getPackageArchiveInfo(apk.absolutePath, 0)
+        val signatureFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+        val archive = context.packageManager.getPackageArchiveInfo(apk.absolutePath, signatureFlags)
             ?: throw DamagedDownloadException("unparseable APK (${apk.length()} bytes)")
-        if (info.packageName != context.packageName) {
-            throw DamagedDownloadException("wrong package ${info.packageName}")
+        if (archive.packageName != context.packageName) {
+            throw DamagedDownloadException("wrong package ${archive.packageName}")
+        }
+        // getPackageArchiveInfo 在部分实现上不填 applicationInfo；null 不能等同于 debuggable，
+        // 否则会把所有合法更新误判为调试包。
+        val flags = archive.applicationInfo?.flags
+            ?: throw DamagedDownloadException("missing applicationInfo")
+        if ((flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            throw DamagedDownloadException("debuggable update")
+        }
+        val current = context.packageManager.getPackageInfo(context.packageName, signatureFlags)
+        if (!sameSigners(archive, current)) {
+            throw DamagedDownloadException("signer mismatch")
+        }
+        // PackageInfo.longVersionCode 是 API 28 字段，minSdk 26；API 26/27 直接访问会抛
+        // NoSuchFieldError，必须走 versionCode 分支。
+        val newVersion = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            archive.longVersionCode
+        } else {
+            archive.versionCode.toLong()
+        }
+        val oldVersion = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            current.longVersionCode
+        } else {
+            current.versionCode.toLong()
+        }
+        if (newVersion <= oldVersion) {
+            throw DamagedDownloadException("version not newer")
+        }
+    }
+
+    /**
+     * 比较两个包的签名集合是否完全一致。
+     *
+     * 使用集合比较而不是"任一匹配"，避免多签名包只匹配其中一个证书就被放行。
+     */
+    private fun sameSigners(archive: PackageInfo, current: PackageInfo): Boolean {
+        val left = signerHashes(archive)
+        val right = signerHashes(current)
+        return left.isNotEmpty() && left == right
+    }
+
+    /**
+     * 取一个包的签名证书 SHA-256 集合。
+     *
+     * API 28+ 走 signingInfo.apkContentsSigners，API 26-27 走已废弃的 signatures。
+     * 若未来启用 v3 轮换，需要按 signingCertificateHistory/lineage 判断。
+     */
+    @Suppress("DEPRECATION")
+    private fun signerHashes(info: PackageInfo): Set<String> {
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            info.signingInfo?.apkContentsSigners.orEmpty()
+        } else {
+            info.signatures.orEmpty()
+        }
+        return signatures.map { signature ->
+            MessageDigest.getInstance("SHA-256")
+                .digest(signature.toByteArray())
+                .joinToString("") { byte -> "%02x".format(byte) }
+        }.toSet()
+    }
+
+    /**
+     * 校验 GitHub Release asset 的 sha256 摘要。
+     *
+     * 老版本 Release 没有 digest 字段时跳过，由签名校验兜底，避免把老版本用户挡在更新之外。
+     *
+     * @param digest 下载过程中同步计算的摘要
+     * @param expectedDigest GitHub 返回的 digest，可为 null
+     */
+    private fun verifyDigest(digest: MessageDigest, expectedDigest: String?) {
+        if (expectedDigest.isNullOrBlank()) return
+        val algorithm = expectedDigest.substringBefore(':').uppercase()
+        val expected = expectedDigest.substringAfter(':', "").lowercase()
+        if (algorithm != "SHA256" || expected.isBlank()) {
+            throw DamagedDownloadException("unsupported digest $expectedDigest")
+        }
+        val actual = digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+        if (!actual.equals(expected, ignoreCase = true)) {
+            throw DamagedDownloadException("digest mismatch")
+        }
+    }
+
+    /**
+     * 跟随 GitHub 的下载重定向，并逐跳校验目标 host。
+     *
+     * Releases 会 302 到 objects.githubusercontent.com 或 release-assets.githubusercontent.com；
+     * 只检查初始 github.com 等于没检查。任何非白名单地址都拒绝。
+     */
+    private fun executeUpdateRequest(request: Request): okhttp3.Response {
+        var current = request
+        repeat(MAX_UPDATE_REDIRECTS + 1) {
+            requireAllowedUpdateUrl(current.url)
+            val response = updateClient.newCall(current).execute()
+            if (response.code !in 300..399) return response
+            val location = response.header("Location")
+            response.close()
+            if (location.isNullOrBlank()) {
+                throw DamagedDownloadException("redirect without Location")
+            }
+            current = current.newBuilder()
+                .url(current.url.resolve(location) ?: throw DamagedDownloadException("bad redirect $location"))
+                .build()
+        }
+        throw DamagedDownloadException("too many redirects")
+    }
+
+    /** 更新链只允许 GitHub 的 HTTPS 主机；见 network_security_config.xml 的同名域名。 */
+    private fun requireAllowedUpdateUrl(url: okhttp3.HttpUrl) {
+        if (url.scheme != "https" || url.host !in UPDATE_HOSTS) {
+            throw DamagedDownloadException("blocked update url ${url.host}")
         }
     }
 
@@ -213,6 +357,8 @@ class UpdateManager(
      * "App not installed".
      */
     private fun install(apk: File) {
+        // Second read of the same path: narrows the verifyApk() -> install() TOCTOU window.
+        verifyApk(apk)
         registerInstallReceiver()
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
@@ -306,5 +452,12 @@ class UpdateManager(
         private const val TAG = "UpdateManager"
         private const val SESSION_ENTRY = "owntv-update"
         private const val INSTALL_STATUS_ACTION = "tv.own.owntv.UPDATE_INSTALL_STATUS"
+        private const val MAX_UPDATE_REDIRECTS = 5
+        private val UPDATE_HOSTS = setOf(
+            "github.com",
+            "api.github.com",
+            "objects.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+        )
     }
 }
